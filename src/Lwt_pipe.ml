@@ -7,10 +7,15 @@ let ret_end = Lwt.return None
 
 exception Closed
 
+type availability =
+  | Pipe_closed
+  | Data_available
+
 type ('a, +'perm) t = {
   close : unit Lwt.u;
   closed : unit Lwt.t;
   readers : 'a option Lwt.u Queue.t;  (* readers *)
+  mutable waiters : availability Lwt.u list;  (* waiting for data *)
   writers : 'a option Queue.t;
   blocked_writers : ('a option * unit Lwt.u) Queue.t; (* blocked writers *)
   max_size : int;
@@ -29,6 +34,7 @@ let create ?on_close ?(max_size=0) () =
     close;
     closed;
     readers = Queue.create ();
+    waiters = [];
     writers = Queue.create ();
     blocked_writers = Queue.create ();
     max_size;
@@ -42,6 +48,7 @@ let is_closed p = not (Lwt.is_sleeping p.closed)
 let close_nonblock p =
   if not (is_closed p) then (
     Lwt.wakeup p.close (); (* evaluate *)
+    List.iter (fun w -> Lwt.wakeup w Pipe_closed;) p.waiters;
     Queue.iter (fun r -> Lwt.wakeup r None) p.readers;
     Queue.iter (fun (_,r) -> Lwt.wakeup r ()) p.blocked_writers;
   )
@@ -74,6 +81,17 @@ let try_read t =
     Some x
   )
 
+let values_available t =
+  if is_closed t then Lwt.return Pipe_closed
+  else begin
+    if Queue.is_empty t.writers && Queue.is_empty t.blocked_writers
+    then
+      let fut, wait = Lwt.wait () in
+      t.waiters <- wait::t.waiters;
+      fut
+    else Lwt.return Data_available
+  end
+
 (* read next one *)
 let read t =
   if is_closed t then ret_end  (* end of stream *)
@@ -87,24 +105,28 @@ let read t =
 (* write a value *)
 let write_step t x =
   if is_closed t then Lwt.fail Closed
-  else if Queue.length t.readers > 0
+  else begin
+    List.iter (fun w -> Lwt.wakeup w Data_available;) t.waiters;
+    t.waiters <- [];
+    if Queue.length t.readers > 0
     then (
       (* some reader waits, synchronize now *)
       let send = Queue.pop t.readers in
       Lwt.wakeup send x;
       Lwt.return_unit
     )
-  else if Queue.length t.writers < t.max_size
-    then (
-      Queue.push x t.writers;
-      Lwt.return_unit  (* into buffer, do not wait *)
+    else if Queue.length t.writers < t.max_size
+      then (
+        Queue.push x t.writers;
+        Lwt.return_unit  (* into buffer, do not wait *)
+      )
+    else (
+      (* block until the queue isn't full anymore *)
+      let is_done, signal_done = Lwt.wait () in
+      Queue.push (x, signal_done) t.blocked_writers;
+      is_done (* block *)
     )
-  else (
-    (* block until the queue isn't full anymore *)
-    let is_done, signal_done = Lwt.wait () in
-    Queue.push (x, signal_done) t.blocked_writers;
-    is_done (* block *)
-  )
+  end
 
 let rec connect_rec r w =
   read r >>= function
